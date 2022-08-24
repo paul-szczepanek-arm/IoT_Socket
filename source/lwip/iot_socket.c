@@ -17,7 +17,11 @@
  */
 
 #include <string.h>
+#include <stdbool.h>
 #include "iot_socket.h"
+#include "lwip/opt.h"
+#include "lwip/api.h"
+#include "lwip/udp.h"
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
 #include "RTE_Components.h"
@@ -33,7 +37,7 @@ static struct {
 } sock_attr[NUM_SOCKS];
 
 // Convert return codes from lwIP to IoT
-static int32_t errno_to_rc (void) {
+static int32_t errno_to_rc(void) {
   int32_t rc;
 
   switch (errno) {
@@ -134,7 +138,7 @@ int32_t iotSocketCreate (int32_t af, int32_t type, int32_t protocol) {
 
   rc = socket(af, type, protocol);
   if (rc < 0) {
-    return errno_to_rc ();
+    return errno_to_rc();
   }
 
   memset (&sock_attr[rc-LWIP_SOCKET_OFFSET], 0, sizeof(sock_attr[0]));
@@ -176,7 +180,7 @@ int32_t iotSocketBind (int32_t socket, const uint8_t *ip, uint32_t ip_len, uint1
 
   rc = bind(socket, (struct sockaddr *)&addr, addr.s2_len);
   if (rc < 0) {
-    rc = errno_to_rc ();
+    rc = errno_to_rc();
     if (rc == IOT_SOCKET_EADDRINUSE && sock_attr[socket-LWIP_SOCKET_OFFSET].bound) {
       return IOT_SOCKET_EINVAL;
     }
@@ -195,7 +199,7 @@ int32_t iotSocketListen (int32_t socket, int32_t backlog) {
     return IOT_SOCKET_EINVAL;
   }
   if (rc < 0) {
-    return errno_to_rc ();
+    return errno_to_rc();
   }
   return rc;
 }
@@ -208,7 +212,7 @@ int32_t iotSocketAccept (int32_t socket, uint8_t *ip, uint32_t *ip_len, uint16_t
 
   rc = accept (socket, (struct sockaddr *)&addr, &addr_len);
   if (rc < 0) {
-    return errno_to_rc ();
+    return errno_to_rc();
   }
 
   // Copy remote IP address and port
@@ -276,7 +280,7 @@ int32_t iotSocketConnect (int32_t socket, const uint8_t *ip, uint32_t ip_len, ui
 
   rc = connect(socket, (struct sockaddr *)&addr, addr.s2_len);
   if (rc < 0) {
-    rc = errno_to_rc ();
+    rc = errno_to_rc();
     if (rc == IOT_SOCKET_ECONNRESET) {
       return IOT_SOCKET_ECONNREFUSED;
     }
@@ -326,7 +330,7 @@ int32_t iotSocketRecv (int32_t socket, void *buf, uint32_t len) {
   }
   rc = recv(socket, buf, len, 0);
   if (rc < 0) {
-    return errno_to_rc ();
+    return errno_to_rc();
   }
 
   return rc;
@@ -346,7 +350,7 @@ int32_t iotSocketRecvFrom (int32_t socket, void *buf, uint32_t len, uint8_t *ip,
   }
   rc = recvfrom(socket, buf, len, 0, (struct sockaddr *)&addr, &addr_len);
   if (rc < 0) {
-    return errno_to_rc ();
+    return errno_to_rc();
   }
 
   // Copy remote IP address and port
@@ -413,9 +417,10 @@ int32_t iotSocketSend (int32_t socket, const void *buf, uint32_t len) {
   if (buf == NULL) {
     return IOT_SOCKET_EINVAL;
   }
+
   rc = send(socket, buf, len, 0);
   if (rc < 0) {
-    rc = errno_to_rc ();
+    rc = errno_to_rc();
     if (rc == IOT_SOCKET_EINPROGRESS && sock_attr[socket-LWIP_SOCKET_OFFSET].ionbio) {
       return IOT_SOCKET_EAGAIN;
     }
@@ -465,10 +470,124 @@ int32_t iotSocketSendTo (int32_t socket, const void *buf, uint32_t len, const ui
   }
 
   if (rc < 0) {
-    return errno_to_rc ();
+    return errno_to_rc();
   }
 
   return rc;
+}
+
+// Send data using a msghdr struct
+int32_t iotSocketSendMsg (int32_t socket, const iot_msghdr *message, int32_t flags) {
+  if (!message) {
+    return IOT_SOCKET_EINVAL;
+  }
+
+  // we need to translate from iot types to lwip so we need to allocate storage for structs
+  struct msghdr lwip_message;
+  struct sockaddr_storage lwip_addr;
+  // copy the original message and address
+  memcpy(&lwip_message, message, sizeof(iot_msghdr));
+  memcpy(&lwip_addr, message->msg_name, message->msg_namelen);
+  // replace address with the newly created one
+  lwip_message.msg_name = &lwip_addr;
+  const iot_sockaddr_in_any *addr = message->msg_name;
+  // fix the constants and size values
+  if (addr->sa_family == IOT_SOCKET_AF_INET) {
+      lwip_message.msg_namelen = sizeof(struct sockaddr_in);
+      lwip_addr.s2_len = sizeof(struct sockaddr_in);
+      lwip_addr.ss_family = AF_INET;
+  } else if (addr->sa_family == IOT_SOCKET_AF_INET6) {
+      lwip_message.msg_namelen = sizeof(struct sockaddr_in6);
+      lwip_addr.s2_len = sizeof(struct sockaddr_in6);
+      lwip_addr.ss_family = AF_INET6;
+  } else {
+    return IOT_SOCKET_EINVAL;
+  }
+
+  // translate parameter flags to lwip flags
+  int lwip_flags = 0;
+  if (flags & IOT_SOCKET_MSG_MORE) {
+    lwip_flags |= MSG_MORE;
+  }
+  if (flags & IOT_SOCKET_MSG_DONTWAIT) {
+    lwip_flags |= MSG_DONTWAIT;
+  }
+
+  iot_cmsghdr *lwip_cmsg = NULL;
+  while(lwip_cmsg = IOT_CMSG_NXTHDR(&lwip_message, lwip_cmsg)) {
+    return IOT_SOCKET_ENOTSUP;
+  }
+
+  ssize_t ret = lwip_sendmsg(socket, &lwip_message, lwip_flags);
+
+  if (ret < 0) {
+    return errno_to_rc();
+  }
+  return (int32_t)ret;
+}
+
+// Receive data using a msghdr struct
+int32_t iotSocketRecvMsg (int32_t socket, iot_msghdr *message, int32_t flags) {
+  if (!message) {
+    return IOT_SOCKET_EINVAL;
+  }
+
+  // the structs are bit compatible
+  struct msghdr *lwip_message = (struct msghdr*) message;
+
+  // translate parameter flags
+  int lwip_flags = 0;
+  if (flags & IOT_SOCKET_MSG_PEEK) {
+    lwip_flags |= MSG_PEEK;
+  }
+  if (flags & IOT_SOCKET_MSG_DONTWAIT) {
+    lwip_flags |= MSG_DONTWAIT;
+  }
+
+  ssize_t ret = lwip_recvmsg(socket, lwip_message, lwip_flags);
+  if (ret < 0) {
+    return errno_to_rc();
+  }
+
+  // translate cmsg type and distinguish in_pktinfo from in6_pktinfo
+  struct cmsghdr* lwip_cmsg = NULL;
+  while(lwip_cmsg = CMSG_NXTHDR(lwip_message, lwip_cmsg)) {
+    if (lwip_cmsg->cmsg_type == IP_PKTINFO) {
+      if (lwip_cmsg->cmsg_len == CMSG_LEN(sizeof(struct in_pktinfo))) {
+        lwip_cmsg->cmsg_type = IOT_SOCKET_IP_PKTINFO;
+        lwip_cmsg->cmsg_level = IOT_SOCKET_LEVEL_IPPROTO_IP;
+      } else {
+        lwip_cmsg->cmsg_type = IOT_SOCKET_IPV6_PKTINFO;
+        lwip_cmsg->cmsg_level = IOT_SOCKET_LEVEL_IPPROTO_IPV6;
+      }
+    }
+  }
+
+  // fix the constants and size values
+  iot_sockaddr_in_any *addr = lwip_message->msg_name;
+  if (addr->sa_family == AF_INET) {
+      lwip_message->msg_namelen = sizeof(iot_sockaddr_in);
+      addr->sa_len = sizeof(iot_sockaddr_in);
+      addr->sa_family = IOT_SOCKET_AF_INET;
+  } else if (addr->sa_family == AF_INET6) {
+      lwip_message->msg_namelen = sizeof(iot_sockaddr_in6);
+      addr->sa_len = sizeof(iot_sockaddr_in6);
+      addr->sa_family = IOT_SOCKET_AF_INET6;
+  } else {
+    return IOT_SOCKET_ERROR;
+  }
+
+  // translate message flags
+  int32_t lwip_msg_flags = lwip_message->msg_flags;
+  message->msg_flags = 0;
+  if (lwip_msg_flags | MSG_TRUNC) {
+    message->msg_flags = IOT_SOCKET_MSG_TRUNC;
+  }
+  if (lwip_message->msg_flags | MSG_CTRUNC) {
+    message->msg_flags = IOT_SOCKET_MSG_CTRUNC;
+  }
+
+  return (int32_t)ret;
 }
 
 // Retrieve local IP address and port of a socket
@@ -479,7 +598,7 @@ int32_t iotSocketGetSockName (int32_t socket, uint8_t *ip, uint32_t *ip_len, uin
 
   rc = getsockname(socket, (struct sockaddr *)&addr, &addr_len);
   if (rc < 0) {
-    return errno_to_rc ();
+    return errno_to_rc();
   }
   if (!sock_attr[socket-LWIP_SOCKET_OFFSET].bound) {
     return IOT_SOCKET_EINVAL;
@@ -526,7 +645,7 @@ int32_t iotSocketGetPeerName (int32_t socket, uint8_t *ip, uint32_t *ip_len, uin
 
   rc = getpeername(socket, (struct sockaddr *)&addr, &addr_len);
   if (rc < 0) {
-    return errno_to_rc ();
+    return errno_to_rc();
   }
 
   rc = IOT_SOCKET_EINVAL;
@@ -570,8 +689,6 @@ int32_t iotSocketGetOpt (int32_t socket, int32_t opt_id, void *opt_val, uint32_t
     return IOT_SOCKET_EINVAL;
   }
   switch (opt_id) {
-    case IOT_SOCKET_IO_FIONBIO:
-      return IOT_SOCKET_EINVAL;
     case IOT_SOCKET_SO_RCVTIMEO: {
 #if LWIP_SO_SNDRCVTIMEO_NONSTANDARD
       rc = getsockopt(socket, SOL_SOCKET, SO_RCVTIMEO,  (char *)opt_val, opt_len);
@@ -606,7 +723,7 @@ int32_t iotSocketGetOpt (int32_t socket, int32_t opt_id, void *opt_val, uint32_t
       return IOT_SOCKET_EINVAL;
   }
   if (rc < 0) {
-    return errno_to_rc ();
+    return errno_to_rc();
   }
   if (*opt_len > 4) *opt_len = 4;
 
@@ -620,6 +737,18 @@ int32_t iotSocketSetOpt (int32_t socket, int32_t opt_id, const void *opt_val, ui
   if ((opt_val == NULL) || (opt_len == 0)) {
     return IOT_SOCKET_EINVAL;
   }
+
+  // LWIP uses int for options and not std types but we are assuming 4 byte int
+  // and since our integer options are always int32_t we can use the pointer directly.
+  // LWIP will accept sizes bigger than expected (char type option will accept an int)
+
+  struct ifreq iface;
+  char *c = (char*)opt_val;
+  uint32_t i;
+#if !LWIP_SO_SNDRCVTIMEO_NONSTANDARD
+  struct timeval tv;
+#endif
+
   switch (opt_id) {
     case IOT_SOCKET_IO_FIONBIO:
       if (opt_len != sizeof(unsigned long)) {
@@ -632,9 +761,8 @@ int32_t iotSocketSetOpt (int32_t socket, int32_t opt_id, const void *opt_val, ui
       break;
     case IOT_SOCKET_SO_RCVTIMEO: {
 #if LWIP_SO_SNDRCVTIMEO_NONSTANDARD
-      rc = setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO,  (const char *)opt_val, opt_len);
+      rc = setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO,  opt_val, opt_len);
 #else
-      struct timeval tv;
       tv.tv_sec  = (*(const int32_t *)opt_val / 1000);
       tv.tv_usec = (*(const int32_t *)opt_val % 1000) * 1000;
       rc = setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO,  (const char *)&tv, sizeof(tv));
@@ -646,24 +774,101 @@ int32_t iotSocketSetOpt (int32_t socket, int32_t opt_id, const void *opt_val, ui
     } break;
     case IOT_SOCKET_SO_SNDTIMEO: {
 #if LWIP_SO_SNDRCVTIMEO_NONSTANDARD
-      rc = setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO,  (const char *)opt_val, opt_len);
+      rc = setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO,  opt_val, opt_len);
 #else
-      struct timeval tv;
       tv.tv_sec  = (*(const int32_t *)opt_val / 1000);
       tv.tv_usec = (*(const int32_t *)opt_val % 1000) * 1000;
       rc = setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO,  (const char *)&tv, sizeof(tv));
 #endif
     } break;
     case IOT_SOCKET_SO_KEEPALIVE:
-      rc = setsockopt(socket, SOL_SOCKET, SO_KEEPALIVE, (const char *)opt_val, opt_len);
+      rc = setsockopt(socket, SOL_SOCKET, SO_KEEPALIVE, opt_val, opt_len);
       break;
-    case IOT_SOCKET_SO_TYPE:
-      return IOT_SOCKET_EINVAL;
+
+    case IOT_SOCKET_SO_REUSEADDR:
+      rc = setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, opt_val, opt_len);
+      break;
+    case IOT_SOCKET_SO_BINDTODEVICE:
+      i = 0;
+      while (i < opt_len && i < (IFNAMSIZ - 1)) {
+        iface.ifr_name[i] = *c;
+        c++;
+        i++;
+      }
+      iface.ifr_name[i] = 0;
+
+      rc = setsockopt(socket, SOL_SOCKET, SO_BINDTODEVICE, &iface, sizeof(iface));
+      break;
+    case IOT_SOCKET_SO_LINGER:
+      rc = setsockopt(socket, SOL_SOCKET, SO_LINGER, opt_val, opt_len);
+      break;
+    case IOT_SOCKET_SO_BROADCAST:
+      rc = setsockopt(socket, SOL_SOCKET, SO_BROADCAST, opt_val, opt_len);
+      break;
+    case IOT_SOCKET_IP_MULTICAST_IF:
+      rc = setsockopt(socket, IPPROTO_IP, IP_MULTICAST_IF, opt_val, opt_len);
+      break;
+    case IOT_SOCKET_IP_MULTICAST_TTL:
+      rc = setsockopt(socket, IPPROTO_IP, IP_MULTICAST_TTL, opt_val, opt_len);
+      break;
+    case IOT_SOCKET_IP_MULTICAST_LOOP:
+      rc = setsockopt(socket, IPPROTO_IP, IP_MULTICAST_LOOP, opt_val, opt_len);
+      break;
+    case IOT_SOCKET_IP_PKTINFO:
+      rc = setsockopt(socket, IPPROTO_IP, IP_PKTINFO, opt_val, opt_len);
+      break;
+    case IOT_SOCKET_IP_ADD_MEMBERSHIP:
+    case IOT_SOCKET_IP_DROP_MEMBERSHIP:
+      if (opt_len != sizeof(iot_ip_mreq)) {
+              return IOT_SOCKET_EINVAL;
+      }
+      // type is byte compatible with lwip
+      rc = setsockopt(socket, IPPROTO_IP, (opt_id == IOT_SOCKET_IP_ADD_MEMBERSHIP) ? IP_ADD_MEMBERSHIP : IP_DROP_MEMBERSHIP, opt_val, opt_len);
+      break;
+    case IOT_SOCKET_IPV6_V6ONLY:
+      rc = setsockopt(socket, IPPROTO_IPV6, IPV6_V6ONLY, opt_val, opt_len);
+      break;
+    case IOT_SOCKET_IPV6_PKTINFO:
+      // we use the IP_PKTINFO instead as there is no IPv6 PKTINFO support yet in LWIP but
+      // LWIP will still copy the address in recv_udp based on the NETCONN_FLAG_PKTINFO which this option will set
+      rc = setsockopt(socket, IPPROTO_IP, IP_PKTINFO, opt_val, opt_len);
+      break;
+    case IOT_SOCKET_IPV6_MULTICAST_IF:
+      rc = setsockopt(socket, IPPROTO_IP, IP_MULTICAST_IF, opt_val, opt_len);
+      break;
+    case IOT_SOCKET_IPV6_MULTICAST_HOPS:
+      rc = setsockopt(socket, IPPROTO_IP, IP_MULTICAST_TTL, opt_val, opt_len);
+      break;
+    case IOT_SOCKET_IPV6_MULTICAST_LOOP:
+      rc = setsockopt(socket, IPPROTO_IP, IP_MULTICAST_LOOP, opt_val, opt_len);
+      break;
+    case IOT_SOCKET_IPV6_ADD_MEMBERSHIP:
+    case IOT_SOCKET_IPV6_DROP_MEMBERSHIP:
+      if (opt_len != sizeof(iot_ipv6_mreq)) {
+        return IOT_SOCKET_EINVAL;
+      }
+      // opt_val type is byte compatible with lwip
+      rc = setsockopt(socket, IPPROTO_IPV6, (opt_id == IOT_SOCKET_IPV6_ADD_MEMBERSHIP) ? IPV6_ADD_MEMBERSHIP : IPV6_DROP_MEMBERSHIP, opt_val, opt_len);
+      break;
+    case IOT_SOCKET_TCP_NODELAY:
+      rc = setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, opt_val, opt_len);
+      break;
+    case IOT_SOCKET_TCP_KEEPIDLE:
+      rc = setsockopt(socket, IPPROTO_TCP, TCP_KEEPIDLE, opt_val, opt_len);
+      break;
+    case IOT_SOCKET_TCP_KEEPINTVL:
+      rc = setsockopt(socket, IPPROTO_TCP, TCP_KEEPINTVL, opt_val, opt_len);
+      break;
+    case IOT_SOCKET_TCP_KEEPCNT:
+      rc = setsockopt(socket, IPPROTO_TCP, TCP_KEEPCNT, opt_val, opt_len);
+      break;
+
     default:
       return IOT_SOCKET_EINVAL;
   }
+
   if (rc < 0) {
-    return errno_to_rc ();
+    return errno_to_rc();
   }
 
   return rc;
@@ -678,10 +883,78 @@ int32_t iotSocketClose (int32_t socket) {
     memset (&sock_attr[socket-LWIP_SOCKET_OFFSET], 0, sizeof(sock_attr[0]));
   }
   if (rc < 0) {
-    return errno_to_rc ();
+    return errno_to_rc();
   }
 
   return rc;
+}
+
+int32_t iotSocketShutdown (int32_t socket, int32_t option) {
+  int lwip_option;
+
+  switch(option)
+  {
+  case IOT_SOCKET_SHUTDOWN_RD:
+    lwip_option = SHUT_RD;
+    break;
+  case IOT_SOCKET_SHUTDOWN_WR:
+    lwip_option = SHUT_WR;
+    break;
+  case IOT_SOCKET_SHUTDOWN_RDWR:
+    lwip_option = SHUT_RDWR;
+    break;
+  default:
+    return IOT_SOCKET_EINVAL;
+  }
+
+  int ret = lwip_shutdown(socket, lwip_option);
+  if (ret < 0) {
+    return errno_to_rc();
+  }
+
+  return 0;
+}
+
+void iotSocketMaskSet (int32_t socket, void *mask) {
+  fd_set *set = (fd_set*)mask;
+  FD_SET(socket, set);
+}
+
+void iotSocketMaskUnset (int32_t socket, void *mask) {
+  fd_set *set = (fd_set*)mask;
+  FD_CLR(socket, set);
+}
+
+uint32_t iotSocketMaskIsSet (int32_t socket, const void *mask) {
+  fd_set *set = (fd_set*)mask;
+  return FD_ISSET(socket, set);
+}
+
+void iotSocketMaskZero (void *mask) {
+  fd_set *set = (fd_set*)mask;
+  FD_ZERO(set);
+}
+
+uint32_t iotSocketMaskGetSize () {
+  return (FD_SETSIZE + 7) / 8;
+}
+
+int32_t iotSocketSelect (void *read_mask, void *write_mask, void *exception_mask, uint32_t timeout_ms) {
+  fd_set *fd_read_set = (fd_set*)read_mask;
+  fd_set *fd_write_set = (fd_set*)write_mask;
+  fd_set *fd_exception_set = (fd_set*)exception_mask;
+  struct timeval tv;
+  tv.tv_sec  = (timeout_ms / 1000);
+  tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+  /* special case for osWaitForever */
+  struct timeval * timeout = (timeout_ms == (uint32_t)-1) ? NULL : &tv;
+
+  int ret = lwip_select(LWIP_SELECT_MAXNFDS, fd_read_set, fd_write_set, fd_exception_set, timeout);
+  if (ret < 0) {
+    return IOT_SOCKET_ERROR;
+  }
+  return ret;
 }
 
 // Retrieve host IP address from host name
@@ -737,4 +1010,36 @@ int32_t iotSocketGetHostByName (const char *name, int32_t af, uint8_t *ip, uint3
   }
 
   return 0;
+}
+
+int32_t iotIpAddrToString (const iot_in_addr *address, char *buf, uint32_t buf_size) {
+  if (ip4addr_ntoa_r((const ip4_addr_t*)address, buf, buf_size)) {
+    return 0;
+  } else {
+    return IOT_SOCKET_ERROR;
+  }
+}
+
+int32_t iotIp6AddrToString (const iot_in6_addr *address, char *buf, uint32_t buf_size) {
+  if (ip6addr_ntoa_r((const ip6_addr_t*)address, buf, buf_size)) {
+    return 0;
+  } else {
+    return IOT_SOCKET_ERROR;
+  }
+}
+
+int32_t iotStringToIpAddr (const char *address_string, iot_in_addr *address) {
+  if (ip4addr_aton(address_string, (ip4_addr_t*)address)) {
+    return 0;
+  } else {
+    return IOT_SOCKET_ERROR;
+  }
+}
+
+int32_t iotStringToIp6Addr (const char *address_string, iot_in6_addr *address) {
+  if (ip6addr_aton(address_string, (ip6_addr_t*)address)) {
+    return 0;
+  } else {
+    return IOT_SOCKET_ERROR;
+  }
 }
